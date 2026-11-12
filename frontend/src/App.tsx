@@ -1,63 +1,148 @@
-import React, { useState, useEffect } from 'react';
-import type { Ticket } from './types';
-import { login, getTickets, createTicket, updateTicket, deleteTicket, saveToken, getToken, removeToken } from './api';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import type { Ticket, TicketPayload, TicketPriority, TicketStatus } from './types';
+import {
+  UNAUTHORIZED_EVENT,
+  login,
+  logout,
+  me,
+  getTickets,
+  createTicket,
+  updateTicket,
+  deleteTicket,
+  getErrorMessage,
+  isNetworkError,
+} from './api';
 import './App.css';
 
+// Единственный источник подписей: и теги в карточке, и селекты рендерятся отсюда
+const STATUS_LABELS: Record<TicketStatus, string> = {
+  new: 'Новая',
+  in_progress: 'В работе',
+  done: 'Готово',
+};
+
+const PRIORITY_LABELS: Record<TicketPriority, string> = {
+  low: 'Низкий',
+  normal: 'Обычный',
+  high: 'Высокий',
+};
+
+const STATUS_OPTIONS = Object.entries(STATUS_LABELS) as [TicketStatus, string][];
+const PRIORITY_OPTIONS = Object.entries(PRIORITY_LABELS) as [TicketPriority, string][];
+// Заявку нельзя создать сразу закрытой — статус 'done' в форме создания не предлагаем
+const CREATE_STATUS_OPTIONS = STATUS_OPTIONS.filter(([value]) => value !== 'done');
+
 function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  // null — сессия еще проверяется. Токен лежит в httpOnly-куке,
+  // поэтому JS не может узнать о ней сам: спрашиваем backend.
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
-  
+
   // Фильтры
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('');
-  const [priorityFilter, setPriorityFilter] = useState('');
-  
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState<TicketStatus | ''>('');
+  const [priorityFilter, setPriorityFilter] = useState<TicketPriority | ''>('');
+
   // Формы
   const [showForm, setShowForm] = useState(false);
   const [editingTicket, setEditingTicket] = useState<Ticket | null>(null);
 
-  // Проверяем вход при загрузке
+  // Ищем заявки только после паузы в наборе
   useEffect(() => {
-    const token = getToken();
-    if (token) {
-      setIsLoggedIn(true);
-      try {
-        const payload = JSON.parse(atob(token.split('.')[1]));
-        setIsAdmin(payload.sub === 'admin');
-      } catch {}
-    }
+    const timer = setTimeout(() => setDebouncedSearch(search), 400);
+    return () => clearTimeout(timer);
+  }, [search]);
+
+  // Пока идёт первичная проверка сессии, событие 401 игнорируем:
+  // сообщение «Сессия истекла» здесь неуместно, экран входа покажем сами
+  const sessionChecked = useRef(false);
+
+  // Восстанавливаем сессию при загрузке: спрашиваем пользователя у backend
+  useEffect(() => {
+    let cancelled = false;
+    me()
+      .then(res => {
+        if (cancelled) return;
+        setError('');
+        setIsLoggedIn(true);
+        setIsAdmin(res.data.is_admin);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setIsLoggedIn(false);
+        // Отличаем «не залогинен» от «сервер недоступен»
+        if (isNetworkError(err)) {
+          setError('Сервер недоступен, проверьте, что backend запущен');
+        }
+      })
+      .finally(() => {
+        sessionChecked.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Если токен истек — возвращаемся на экран входа
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      if (!sessionChecked.current) return;
+      setIsLoggedIn(false);
+      setIsAdmin(false);
+      setError('Сессия истекла, войдите заново');
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, handleUnauthorized);
+  }, []);
+
+  // Номер последнего запроса: ответы устаревших запросов игнорируем,
+  // иначе при быстром переключении страниц старый ответ перезапишет новый
+  const lastRequestId = useRef(0);
+
+  const loadTickets = useCallback(async () => {
+    const requestId = ++lastRequestId.current;
+    setLoading(true);
+    setError('');
+    try {
+      const res = await getTickets({
+        page,
+        page_size: 10,
+        search: debouncedSearch || undefined,
+        status: statusFilter || undefined,
+        priority: priorityFilter || undefined,
+      });
+      if (requestId !== lastRequestId.current) return;
+      setTickets(res.data.items);
+      setTotalPages(res.data.pages);
+      // Если страница опустела (удалили записи) — вернемся на предыдущую
+      if (res.data.items.length === 0 && page > 1) {
+        setPage(page - 1);
+      }
+    } catch (err) {
+      if (requestId !== lastRequestId.current) return;
+      setError(getErrorMessage(err, 'Ошибка загрузки'));
+    } finally {
+      if (requestId === lastRequestId.current) {
+        setLoading(false);
+      }
+    }
+  }, [page, debouncedSearch, statusFilter, priorityFilter]);
 
   // Загружаем заявки
   useEffect(() => {
     if (isLoggedIn) {
+      // Загрузка данных в эффекте — это легитимный сайд-эффект:
+      // setState здесь происходит в async-колбэках запроса, а не в теле эффекта.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       loadTickets();
     }
-  }, [isLoggedIn, page, search, statusFilter, priorityFilter]);
-
-  const loadTickets = async () => {
-    setLoading(true);
-    setError('');
-    try {
-      const params: any = { page, page_size: 10 };
-      if (search) params.search = search;
-      if (statusFilter) params.status = statusFilter;
-      if (priorityFilter) params.priority = priorityFilter;
-      
-      const res = await getTickets(params);
-      setTickets(res.data.items);
-      setTotalPages(res.data.pages);
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка загрузки');
-    } finally {
-      setLoading(false);
-    }
-  };
+  }, [isLoggedIn, loadTickets]);
 
   // Логин
   const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -67,33 +152,46 @@ function App() {
     const password = (form.elements.namedItem('password') as HTMLInputElement).value;
     try {
       const res = await login(username, password);
-      saveToken(res.data.access_token);
+      // Токен уже в httpOnly-куке, в JS его хранить не нужно
       setIsLoggedIn(true);
-      setIsAdmin(username === 'admin');
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка входа');
+      setIsAdmin(res.data.is_admin);
+      setError('');
+    } catch (err) {
+      setError(getErrorMessage(err, 'Ошибка входа'));
     }
   };
 
   // Выход
-  const handleLogout = () => {
-    removeToken();
+  const handleLogout = async () => {
+    try {
+      await logout();
+    } catch {
+      // даже если запрос не прошел — локально сессию закрываем
+    }
     setIsLoggedIn(false);
     setIsAdmin(false);
   };
 
   // Создание
-  const handleCreate = async (data: any) => {
-    await createTicket(data);
-    setShowForm(false);
-    loadTickets();
+  const handleCreate = async (data: TicketPayload) => {
+    try {
+      await createTicket(data);
+      setShowForm(false);
+      loadTickets();
+    } catch (err) {
+      setError(getErrorMessage(err, 'Ошибка создания заявки'));
+    }
   };
 
   // Обновление
-  const handleUpdate = async (id: number, data: any) => {
-    await updateTicket(id, data);
-    setEditingTicket(null);
-    loadTickets();
+  const handleUpdate = async (id: number, data: Partial<TicketPayload>) => {
+    try {
+      await updateTicket(id, data);
+      setEditingTicket(null);
+      loadTickets();
+    } catch (err) {
+      setError(getErrorMessage(err, 'Ошибка обновления заявки'));
+    }
   };
 
   // Удаление
@@ -102,24 +200,29 @@ function App() {
     try {
       await deleteTicket(id);
       loadTickets();
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Ошибка удаления');
+    } catch (err) {
+      setError(getErrorMessage(err, 'Ошибка удаления'));
     }
   };
 
   // Смена статуса
-  const handleStatusChange = async (ticket: Ticket, newStatus: string) => {
+  const handleStatusChange = async (ticket: Ticket, newStatus: TicketStatus) => {
     if (ticket.status === 'done') {
-      alert('Нельзя менять статус у выполненных заявок');
+      setError('Нельзя менять статус у выполненных заявок');
       return;
     }
     try {
       await updateTicket(ticket.id, { status: newStatus });
       loadTickets();
-    } catch (err: any) {
-      alert(err.response?.data?.detail || 'Ошибка');
+    } catch (err) {
+      setError(getErrorMessage(err, 'Ошибка смены статуса'));
     }
   };
+
+  // Пока проверяем сессию — держим заглушку, чтобы не мигал экран входа
+  if (isLoggedIn === null) {
+    return <div className="loading">Загрузка...</div>;
+  }
 
   // Экран логина
   if (!isLoggedIn) {
@@ -157,18 +260,18 @@ function App() {
       {editingTicket && <TicketForm ticket={editingTicket} onSubmit={(d) => handleUpdate(editingTicket.id, d)} onCancel={() => setEditingTicket(null)} />}
 
       <div className="filters">
-        <input placeholder="Поиск..." value={search} onChange={e => setSearch(e.target.value)} />
-        <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
+        <input placeholder="Поиск..." value={search} onChange={e => { setSearch(e.target.value); setPage(1); }} />
+        <select value={statusFilter} onChange={e => { setStatusFilter(e.target.value as TicketStatus | ''); setPage(1); }}>
           <option value="">Все статусы</option>
-          <option value="new">Новая</option>
-          <option value="in_progress">В работе</option>
-          <option value="done">Готово</option>
+          {STATUS_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
         </select>
-        <select value={priorityFilter} onChange={e => setPriorityFilter(e.target.value)}>
+        <select value={priorityFilter} onChange={e => { setPriorityFilter(e.target.value as TicketPriority | ''); setPage(1); }}>
           <option value="">Любой приоритет</option>
-          <option value="low">Низкий</option>
-          <option value="normal">Нормальный</option>
-          <option value="high">Высокий</option>
+          {PRIORITY_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
         </select>
       </div>
 
@@ -183,18 +286,18 @@ function App() {
             <div className="ticket-head">
               <h3>{t.title}</h3>
               <div>
-                <span className={`tag status-${t.status}`}>{t.status}</span>
-                <span className={`tag priority-${t.priority}`}>{t.priority}</span>
+                <span className={`tag status-${t.status}`}>{STATUS_LABELS[t.status]}</span>
+                <span className={`tag priority-${t.priority}`}>{PRIORITY_LABELS[t.priority]}</span>
               </div>
             </div>
             {t.description && <p>{t.description}</p>}
             <div className="ticket-foot">
               <small>{new Date(t.created_at).toLocaleString()}</small>
               <div>
-                <select value={t.status} onChange={e => handleStatusChange(t, e.target.value)} disabled={t.status === 'done'}>
-                  <option value="new">Новая</option>
-                  <option value="in_progress">В работе</option>
-                  <option value="done">Готово</option>
+                <select value={t.status} onChange={e => handleStatusChange(t, e.target.value as TicketStatus)} disabled={t.status === 'done'}>
+                  {STATUS_OPTIONS.map(([value, label]) => (
+                    <option key={value} value={value}>{label}</option>
+                  ))}
                 </select>
                 {t.status !== 'done' && (
                   <>
@@ -219,14 +322,20 @@ function App() {
   );
 }
 
-// Компонент формы
-function TicketForm({ ticket, onSubmit, onCancel }: any) {
-  const [title, setTitle] = useState(ticket?.title || '');
-  const [description, setDescription] = useState(ticket?.description || '');
-  const [priority, setPriority] = useState(ticket?.priority || 'normal');
-  const [status, setStatus] = useState(ticket?.status || 'new');
+interface TicketFormProps {
+  ticket?: Ticket;
+  onSubmit: (data: TicketPayload) => void;
+  onCancel: () => void;
+}
 
-  const handleSubmit = (e: React.FormEvent) => {
+// Компонент формы
+function TicketForm({ ticket, onSubmit, onCancel }: TicketFormProps) {
+  const [title, setTitle] = useState(ticket?.title ?? '');
+  const [description, setDescription] = useState(ticket?.description ?? '');
+  const [priority, setPriority] = useState<TicketPriority>(ticket?.priority ?? 'normal');
+  const [status, setStatus] = useState<TicketStatus>(ticket?.status ?? 'new');
+
+  const handleSubmit = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     onSubmit({ title, description: description || null, priority, status });
   };
@@ -236,16 +345,16 @@ function TicketForm({ ticket, onSubmit, onCancel }: any) {
       <h2>{ticket ? 'Редактировать' : 'Создать'} заявку</h2>
       <input placeholder="Заголовок (3-120 символов)" value={title} onChange={e => setTitle(e.target.value)} required minLength={3} maxLength={120} />
       <textarea placeholder="Описание (необязательно)" value={description} onChange={e => setDescription(e.target.value)} maxLength={1000} />
-      <select value={priority} onChange={e => setPriority(e.target.value)}>
-        <option value="low">Низкий приоритет</option>
-        <option value="normal">Нормальный приоритет</option>
-        <option value="high">Высокий приоритет</option>
+      <select value={priority} onChange={e => setPriority(e.target.value as TicketPriority)}>
+        {PRIORITY_OPTIONS.map(([value, label]) => (
+          <option key={value} value={value}>{label} приоритет</option>
+        ))}
       </select>
       {!ticket && (
-        <select value={status} onChange={e => setStatus(e.target.value)}>
-          <option value="new">Новая</option>
-          <option value="in_progress">В работе</option>
-          <option value="done">Готово</option>
+        <select value={status} onChange={e => setStatus(e.target.value as TicketStatus)}>
+          {CREATE_STATUS_OPTIONS.map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
         </select>
       )}
       <div>
